@@ -1,0 +1,330 @@
+variables:
+  PYTHON_VERSION: "3.11"
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_NAME: $CI_REGISTRY_IMAGE/ecom-app
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_VERIFY: 1
+  DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+
+stages:
+  - lint
+  - test
+  - build
+  - security
+  - deploy-staging
+  - deploy-production
+
+# Define reusable templates
+.python_template: &python_template
+  image: python:${PYTHON_VERSION}
+  before_script:
+    - pip install --upgrade pip
+    - pip install flake8 pytest pytest-cov black isort pylint bandit safety
+    - if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - if [ -f app/requirements.txt ]; then pip install -r app/requirements.txt; fi
+
+.docker_template: &docker_template
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+
+# Lint Stage
+lint:black:
+  <<: *python_template
+  stage: lint
+  script:
+    - black --check --diff .
+  allow_failure: true
+
+lint:flake8:
+  <<: *python_template
+  stage: lint
+  script:
+    - flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+    - flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+  artifacts:
+    reports:
+      codequality: flake8-report.json
+  allow_failure: true
+
+lint:isort:
+  <<: *python_template
+  stage: lint
+  script:
+    - isort --check-only --diff .
+  allow_failure: true
+
+security:bandit:
+  <<: *python_template
+  stage: lint
+  script:
+    - bandit -r . -f json -o bandit-report.json || true
+    - bandit -r . -ll
+  artifacts:
+    paths:
+      - bandit-report.json
+    expire_in: 1 week
+  allow_failure: true
+
+security:dependencies:
+  <<: *python_template
+  stage: lint
+  script:
+    - safety check --json > safety-report.json || true
+    - cat safety-report.json
+  artifacts:
+    paths:
+      - safety-report.json
+    expire_in: 1 week
+  allow_failure: true
+
+# Test Stage
+test:unit:
+  <<: *python_template
+  stage: test
+  script:
+    - |
+      if [ -d "tests" ]; then
+        pytest tests/ --cov=. --cov-report=xml --cov-report=html --cov-report=term --junitxml=test-results.xml
+      else
+        echo "No tests directory found"
+      fi
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+  artifacts:
+    reports:
+      junit: test-results.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths:
+      - htmlcov/
+    expire_in: 1 week
+  allow_failure: true
+
+# Build Stage
+build:docker:
+  <<: *docker_template
+  stage: build
+  script:
+    - docker pull $IMAGE_NAME:latest || true
+    - |
+      docker build \
+        --cache-from $IMAGE_NAME:latest \
+        --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+        --build-arg VCS_REF=$CI_COMMIT_SHORT_SHA \
+        --build-arg VERSION=$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA \
+        -t $IMAGE_NAME:$CI_COMMIT_SHORT_SHA \
+        -t $IMAGE_NAME:$CI_COMMIT_REF_NAME \
+        -t $IMAGE_NAME:latest \
+        .
+    - docker push $IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+    - docker push $IMAGE_NAME:$CI_COMMIT_REF_NAME
+    - docker push $IMAGE_NAME:latest
+  only:
+    - main
+    - develop
+    - tags
+
+# Security Scan Stage
+security:container-scan:
+  <<: *docker_template
+  stage: security
+  script:
+    - |
+      docker run --rm \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        aquasec/trivy image \
+        --severity HIGH,CRITICAL \
+        --format json \
+        --output trivy-report.json \
+        $IMAGE_NAME:$CI_COMMIT_SHORT_SHA || true
+    - cat trivy-report.json
+  artifacts:
+    paths:
+      - trivy-report.json
+    expire_in: 1 week
+  dependencies:
+    - build:docker
+  only:
+    - main
+    - develop
+
+# Deploy to Staging
+deploy:staging:
+  stage: deploy-staging
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client bash curl
+    - eval $(ssh-agent -s)
+    - echo "$STAGING_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $STAGING_HOST >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - |
+      ssh $STAGING_USER@$STAGING_HOST << 'ENDSSH'
+        cd /opt/ecom-app
+        export IMAGE_TAG=$CI_COMMIT_SHORT_SHA
+        docker-compose pull
+        docker-compose down
+        docker-compose up -d
+        docker-compose ps
+      ENDSSH
+    - sleep 10
+    - curl -f http://$STAGING_HOST:8501/health || echo "Health check not available"
+  environment:
+    name: staging
+    url: http://$STAGING_HOST:8501
+    on_stop: stop:staging
+  only:
+    - develop
+  dependencies:
+    - build:docker
+
+stop:staging:
+  stage: deploy-staging
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$STAGING_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $STAGING_HOST >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh $STAGING_USER@$STAGING_HOST << 'ENDSSH'
+        cd /opt/ecom-app
+        docker-compose down
+      ENDSSH
+  environment:
+    name: staging
+    action: stop
+  when: manual
+  only:
+    - develop
+
+# Deploy to Production
+deploy:production:
+  stage: deploy-production
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client bash curl
+    - eval $(ssh-agent -s)
+    - echo "$PROD_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $PROD_HOST >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - |
+      ssh $PROD_USER@$PROD_HOST << 'ENDSSH'
+        cd /opt/ecom-app
+        
+        # Backup current state
+        docker-compose config > docker-compose.backup.yml
+        
+        # Deploy
+        export IMAGE_TAG=$CI_COMMIT_SHORT_SHA
+        docker-compose pull
+        docker-compose up -d --no-deps --build
+        
+        # Health check with rollback
+        sleep 15
+        if ! curl -f http://localhost:8501/health; then
+          echo "Health check failed, rolling back..."
+          docker-compose down
+          docker-compose -f docker-compose.backup.yml up -d
+          exit 1
+        fi
+        
+        # Cleanup
+        docker image prune -f
+      ENDSSH
+    - sleep 10
+    - curl -f http://$PROD_HOST:8501/health || echo "Health check not available"
+  environment:
+    name: production
+    url: http://$PROD_HOST:8501
+    on_stop: stop:production
+  when: manual
+  only:
+    - main
+  dependencies:
+    - build:docker
+
+stop:production:
+  stage: deploy-production
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$PROD_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $PROD_HOST >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh $PROD_USER@$PROD_HOST << 'ENDSSH'
+        cd /opt/ecom-app
+        docker-compose down
+      ENDSSH
+  environment:
+    name: production
+    action: stop
+  when: manual
+  only:
+    - main
+
+# Notifications
+.notify_template: &notify_template
+  image: curlimages/curl:latest
+  when: always
+
+notify:slack:success:
+  <<: *notify_template
+  stage: .post
+  script:
+    - |
+      curl -X POST -H 'Content-type: application/json' \
+      --data "{
+        \"text\":\"✅ Pipeline Success\",
+        \"blocks\":[{
+          \"type\":\"section\",
+          \"text\":{
+            \"type\":\"mrkdwn\",
+            \"text\":\"*Pipeline:* $CI_PROJECT_NAME\n*Branch:* $CI_COMMIT_REF_NAME\n*Commit:* $CI_COMMIT_SHORT_SHA\n*Author:* $GITLAB_USER_NAME\"
+          }
+        }]
+      }" \
+      $SLACK_WEBHOOK_URL
+  only:
+    - main
+    - develop
+  when: on_success
+
+notify:slack:failure:
+  <<: *notify_template
+  stage: .post
+  script:
+    - |
+      curl -X POST -H 'Content-type: application/json' \
+      --data "{
+        \"text\":\"❌ Pipeline Failed\",
+        \"blocks\":[{
+          \"type\":\"section\",
+          \"text\":{
+            \"type\":\"mrkdwn\",
+            \"text\":\"*Pipeline:* $CI_PROJECT_NAME\n*Branch:* $CI_COMMIT_REF_NAME\n*Commit:* $CI_COMMIT_SHORT_SHA\n*Author:* $GITLAB_USER_NAME\"
+          }
+        }]
+      }" \
+      $SLACK_WEBHOOK_URL
+  only:
+    - main
+    - develop
+  when: on_failure
